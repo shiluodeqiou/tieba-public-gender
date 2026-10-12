@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { JSDOM, VirtualConsole } = require('jsdom');
-const { extractUsername, bootstrap, CONFIG } = require('../tieba-public-gender.user.js');
+const { extractUsername, extractIdentity, bootstrap, CONFIG } = require('../tieba-public-gender.user.js');
 
 const BADGE = '.tb-public-gender-badge';
 const field = (value) => JSON.stringify(value).replaceAll('&', '&amp;').replaceAll('"', '&quot;');
@@ -19,18 +19,19 @@ const reply = (name) => `
             ：回复 <a class="at j_user_card" data-field="${field({ un: '被提及账号' })}">被提及昵称</a></div>
     </li>`;
 
-function setup(html, customRequest) {
+function setup(html, customRequest, options = {}) {
     const virtualConsole = new VirtualConsole();
     const dom = new JSDOM(`<html><head></head><body>${html}</body></html>`, {
-        url: 'https://tieba.baidu.com/p/123456789?pn=1', virtualConsole
+        url: options.url || 'https://tieba.baidu.com/p/123456789?pn=1', virtualConsole
     });
     const window = dom.window;
     const requests = [];
     const menus = new Map();
-    const values = new Map();
+    const values = new Map(options.values);
     window.GM_getValue = (key, fallback) => values.has(key) ? values.get(key) : fallback;
     window.GM_setValue = (key, value) => values.set(key, value);
-    window.GM_registerMenuCommand = (label, callback) => menus.set(label, callback);
+    window.GM_registerMenuCommand = (label, callback) => { menus.set(label, callback); return label; };
+    window.GM_unregisterMenuCommand = (label) => menus.delete(label);
     window.GM_xmlhttpRequest = (details) => {
         const name = new URL(details.url).searchParams.get('un');
         requests.push(name);
@@ -42,7 +43,7 @@ function setup(html, customRequest) {
     };
     let runtime;
     return { window, requests, menus, values, virtualConsole,
-        start() { runtime = bootstrap(window, { queue: { intervalMs: 0 } }); return runtime; },
+        start() { runtime = bootstrap(window, { queue: { intervalMs: 0, ...options.queue } }); return runtime; },
         close() { runtime?.disconnect(); window.close(); } };
 }
 
@@ -119,7 +120,7 @@ test('动态插入的楼中楼由观察器处理，复制已标记节点不会�
     } finally { fixture.close(); }
 });
 
-test('没有可靠账号只显示未知，菜单能隐藏未知但保留公开资料标记', async () => {
+test('没有可靠账号标识只显示未知，菜单能隐藏未知并原地重新查询', async () => {
     const fixture = setup(main('账号甲') + `
         <li class="lzl_single_post"><div class="lzl_cnt">
             <a class="j_user_card" href="/home/main?id=opaque">无法查询的显示昵称</a>
@@ -131,20 +132,19 @@ test('没有可靠账号只显示未知，菜单能隐藏未知但保留公开�
             doc.querySelector(`${BADGE}[data-gender="male"]`));
         assert.equal(fixture.requests.includes('无法查询的显示昵称'), false);
         const unknownBadges = [...doc.querySelectorAll(`${BADGE}[data-gender="unknown"]`)];
-        assert.match(unknownBadges[0].title, /可靠的账号名/);
-        const toggle = fixture.menus.get('显示/隐藏“未知”标记');
-        toggle();
+        assert.match(unknownBadges[0].title, /可靠的账号标识/);
+        fixture.menus.get('未知标记：显示（点击隐藏）')();
         assert.ok(unknownBadges.every((badge) => badge.hidden));
         assert.equal(doc.querySelector(`${BADGE}[data-gender="male"]`).hidden, false);
         assert.equal(fixture.values.get(CONFIG.showUnknownKey), false);
-        toggle();
+        assert.ok(fixture.menus.has('未知标记：隐藏（点击显示）'));
+        fixture.menus.get('未知标记：隐藏（点击显示）')();
         assert.ok(unknownBadges.every((badge) => !badge.hidden));
-        assert.ok(fixture.menus.has('清空性别资料缓存并刷新'));
-        // jsdom 不导航；仍可核对菜单在导航前已清空持久化缓存。
-        const errors = [];
-        fixture.virtualConsole.on('jsdomError', (error) => errors.push(error));
-        fixture.menus.get('清空性别资料缓存并刷新')();
+        fixture.menus.get('清空性别资料缓存并重新查询')();
         assert.equal(fixture.values.get(CONFIG.cacheKey).entries.length, 0);
+        await waitFor(() => fixture.requests.length === 4 &&
+            doc.querySelector(`${BADGE}[data-gender="male"]`));
+        assert.equal(fixture.window.location.href, 'https://tieba.baidu.com/p/123456789?pn=1');
     } finally { fixture.close(); }
 });
 
@@ -173,7 +173,7 @@ test('昵称节点被新作者复用时，迟到的旧资料不会覆盖新作�
     } finally { fixture.close(); }
 });
 
-test('浏览器直接执行可安装脚本时会启动；其他站点与列表页不会启动', async () => {
+test('浏览器直接执行可安装脚本时会启动；其他站点不启动', async () => {
     const fs = require('node:fs');
     const path = require('node:path');
     const script = fs.readFileSync(path.join(__dirname, '../tieba-public-gender.user.js'), 'utf8');
@@ -193,11 +193,195 @@ test('浏览器直接执行可安装脚本时会启动；其他站点与列表�
         window.eval(script);
         await waitFor(() => window.document.querySelector(`${BADGE}[data-gender="male"]`));
     } finally { dom.window.close(); }
-    for (const url of ['https://tieba.baidu.com/f?kw=测试', 'https://example.com/p/123']) {
+    for (const url of ['https://example.com/p/123']) {
         const other = new JSDOM(`<body>${main('账号甲')}</body>`, { url });
         try {
             assert.equal(bootstrap(other.window), null);
             assert.equal(other.window.document.querySelector(BADGE), null);
         } finally { other.window.close(); }
     }
+});
+
+// Vue 可创建嵌套链接；用 DOM 方法保留这种结构，避免 HTML 解析器自动拆开 a 标签。
+function appendModernAuthor(doc, portrait, display, kind = 'pb-comment-item') {
+    const wrapper = doc.createElement('section');
+    wrapper.className = kind;
+    wrapper.innerHTML = `<div class="head-line user-info"><a class="head-avatar">头像</a>
+        <div class="head-info"></div></div><p>回复 <a class="head-name mention">被提及昵称</a></p>`;
+    const outer = doc.createElement('a');
+    outer.className = 'name-info-link';
+    outer.href = `/home/main?id=${encodeURIComponent(portrait)}&fr=pb`;
+    const info = doc.createElement('div');
+    info.className = 'name-info';
+    const author = doc.createElement('a');
+    author.className = 'head-name';
+    author.href = outer.href;
+    author.textContent = display;
+    info.append(author);
+    outer.append(info);
+    wrapper.querySelector('.head-info').append(outer);
+    wrapper.querySelector('.head-avatar').href = outer.href;
+    doc.body.append(wrapper);
+    return author;
+}
+
+test('新版主楼、回复和楼中楼使用 portrait 查询；不标记外层链接、头像或提及', async () => {
+    const fixture = setup('', (details, name) => {
+        assert.equal(name, null);
+        const portrait = new URL(details.url).searchParams.get('id');
+        fixture.window.setTimeout(() => details.onload({ status: 200, finalUrl: details.url,
+            responseText: JSON.stringify({ no: 0, data: { name: '真实账号与显示昵称不同',
+                portrait: `${portrait}?t=1773053660`, sex: portrait.endsWith('beta') ? 'female' : 'male' } }) }), 1);
+        return { abort() {} };
+    });
+    try {
+        const doc = fixture.window.document;
+        const first = appendModernAuthor(doc, 'tb.1.fixture.alpha', '甲的显示昵称', 'image-text');
+        const second = appendModernAuthor(doc, 'tb.1.fixture.beta', '乙的显示昵称');
+        const nested = appendModernAuthor(doc, 'tb.1.fixture.alpha', '甲再次回复', 'lzl-item');
+        assert.deepEqual(extractIdentity(first), { kind: 'portrait', value: 'tb.1.fixture.alpha' });
+        fixture.start();
+        await waitFor(() => doc.querySelectorAll(`${BADGE}[data-gender="male"]`).length === 2 &&
+            doc.querySelectorAll(`${BADGE}[data-gender="female"]`).length === 1);
+        assert.equal(fixture.requests.length, 2);
+        assert.equal(first.nextElementSibling.textContent, '♂ 男');
+        assert.equal(second.nextElementSibling.textContent, '♀ 女');
+        assert.equal(nested.nextElementSibling.textContent, '♂ 男');
+        assert.equal(doc.querySelectorAll('.name-info > .tb-public-gender-badge').length, 3);
+        for (const anchor of doc.querySelectorAll('.head-avatar, .mention, .name-info-link')) {
+            assert.equal(anchor.nextElementSibling?.matches(BADGE) || false, false);
+        }
+        assert.match(doc.querySelector('.tbpg-summary').textContent, /识别 3 个作者.*男 2.*女 1/);
+        await new Promise((resolve) => setTimeout(resolve, 350));
+        assert.equal(fixture.requests.length, 2, '脚本自身修改不能触发重复查询');
+    } finally { fixture.close(); }
+});
+
+test('初始关闭不查询；页面按钮和菜单切换状态并保存设置', async () => {
+    const fixture = setup(main('账号甲'), null, { values: [[CONFIG.enabledKey, false]] });
+    try {
+        fixture.start();
+        const doc = fixture.window.document;
+        assert.match(doc.querySelector('.tbpg-title').textContent, /已关闭.*1\.0\.1/);
+        assert.equal(doc.querySelector(BADGE), null);
+        assert.equal(fixture.requests.length, 0);
+        assert.ok(fixture.menus.has('标记功能：已关闭（点击开启）'));
+        doc.querySelector('.tbpg-toggle').click();
+        await waitFor(() => doc.querySelector(`${BADGE}[data-gender="male"]`));
+        assert.equal(fixture.values.get(CONFIG.enabledKey), true);
+        assert.equal(doc.querySelector('.tbpg-toggle').getAttribute('aria-pressed'), 'true');
+        assert.ok(fixture.menus.has('标记功能：已开启（点击关闭）'));
+        fixture.menus.get('标记功能：已开启（点击关闭）')();
+        assert.equal(doc.querySelector(BADGE), null);
+        assert.equal(fixture.values.get(CONFIG.enabledKey), false);
+        assert.equal(doc.querySelector('.tbpg-toggle').textContent, '开启标记');
+        assert.equal(fixture.menus.size, 3);
+        doc.querySelector('.tbpg-collapse').click();
+        assert.equal(doc.querySelector('.tbpg-content').hidden, true);
+        assert.equal(doc.querySelector('.tbpg-collapse').getAttribute('aria-expanded'), 'false');
+        doc.querySelector('.tbpg-collapse').click();
+        assert.equal(doc.querySelector('.tbpg-content').hidden, false);
+    } finally { fixture.close(); }
+});
+
+test('关闭后不发送排队请求，迟到响应不恢复标记，重新开启后恢复', async () => {
+    const responses = new Map();
+    const fixture = setup(main('账号甲') + main('账号乙'), (details, name) => {
+        responses.set(name, details);
+        return { abort() {} };
+    }, { queue: { concurrency: 1 } });
+    try {
+        const runtime = fixture.start();
+        const doc = fixture.window.document;
+        await waitFor(() => responses.has('账号甲'));
+        runtime.toggleEnabled();
+        responses.get('账号甲').onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '账号甲', sex: 'male' } }) });
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        assert.deepEqual(fixture.requests, ['账号甲']);
+        assert.equal(doc.querySelector(BADGE), null);
+        runtime.toggleEnabled();
+        await waitFor(() => responses.has('账号乙'));
+        responses.get('账号乙').onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '账号乙', sex: 'female' } }) });
+        await waitFor(() => doc.querySelector(`${BADGE}[data-gender="female"]`));
+        assert.ok(doc.querySelector(`${BADGE}[data-gender="male"]`));
+        assert.equal(doc.querySelector(`${BADGE}[data-gender="unknown"]`), null);
+        assert.deepEqual(fixture.requests, ['账号甲', '账号乙']);
+    } finally { fixture.close(); }
+});
+
+test('未识别作者、请求接口缺失和请求失败均在面板明确提示', async () => {
+    const empty = setup('帖子内容尚未载入');
+    const missing = setup(main('账号甲'));
+    const denied = setup(main('账号甲'), (details) => {
+        queueMicrotask(() => details.onload({ status: 403 }));
+        return { abort() {} };
+    });
+    try {
+        empty.start();
+        assert.match(empty.window.document.querySelector('.tbpg-detail').textContent, /尚未识别到作者/);
+        delete missing.window.GM_xmlhttpRequest;
+        missing.start();
+        await waitFor(() => missing.window.document.querySelector(`${BADGE}[data-gender="unknown"]`));
+        assert.match(missing.window.document.querySelector('.tbpg-detail').textContent, /油猴请求接口不可用/);
+        denied.start();
+        const doc = denied.window.document;
+        await waitFor(() => doc.querySelector(`${BADGE}[data-gender="unknown"]`));
+        assert.match(doc.querySelector('.tbpg-detail').textContent, /拒绝访问/);
+        doc.querySelector('.tbpg-unknown').click();
+        assert.equal(doc.querySelector(BADGE).hidden, true);
+        assert.match(doc.querySelector('.tbpg-summary').textContent, /未知 1（隐藏）/);
+    } finally { empty.close(); missing.close(); denied.close(); }
+});
+
+test('从列表通过 SPA 进入帖子会启动，离开帖子后清理面板与标记', async () => {
+    const fixture = setup(main('账号甲'), null, { url: 'https://tieba.baidu.com/f?kw=测试' });
+    try {
+        fixture.start();
+        const { window } = fixture;
+        const doc = window.document;
+        assert.equal(doc.querySelector('#tb-public-gender-status'), null);
+        assert.equal(fixture.requests.length, 0);
+        window.history.pushState({}, '', '/p/123');
+        await waitFor(() => doc.querySelector(`${BADGE}[data-gender="male"]`));
+        window.history.pushState({}, '', '/f?kw=测试');
+        window.dispatchEvent(new window.PopStateEvent('popstate'));
+        assert.equal(doc.querySelector(BADGE), null);
+        assert.equal(doc.querySelector('#tb-public-gender-status'), null);
+        assert.equal(fixture.requests.length, 1);
+    } finally { fixture.close(); }
+});
+
+test('油猴接口只存在词法作用域而不在 window 上时也能正常标记', async () => {
+    const fs = require('node:fs');
+    const path = require('node:path');
+    const source = fs.readFileSync(path.join(__dirname, '../tieba-public-gender.user.js'), 'utf8');
+    const dom = new JSDOM(`<body>${main('账号甲')}</body>`, {
+        url: 'https://tieba.baidu.com/p/123', runScripts: 'outside-only'
+    });
+    let requests = 0;
+    const values = new Map();
+    const menus = new Map();
+    try {
+        const run = dom.window.Function('GM_getValue', 'GM_setValue', 'GM_registerMenuCommand',
+            'GM_xmlhttpRequest', 'GM_unregisterMenuCommand', source);
+        run((key, fallback) => values.has(key) ? values.get(key) : fallback,
+            (key, value) => values.set(key, value),
+            (label, callback) => { menus.set(label, callback); return label; },
+            (details) => {
+                requests += 1;
+                queueMicrotask(() => details.onload({ status: 200, finalUrl: details.url,
+                    responseText: JSON.stringify({ no: 0, data: { name: '账号甲', sex: 'male' } }) }));
+                return { abort() {} };
+            }, (label) => menus.delete(label));
+        const doc = dom.window.document;
+        await waitFor(() => doc.querySelector(`${BADGE}[data-gender="male"]`));
+        assert.equal(dom.window.GM_xmlhttpRequest, undefined);
+        assert.equal(requests, 1);
+        assert.equal(menus.size, 3);
+        doc.querySelector('.tbpg-toggle').click();
+        assert.equal(values.get(CONFIG.enabledKey), false);
+        assert.ok(menus.has('标记功能：已关闭（点击开启）'));
+    } finally { dom.window.close(); }
 });

@@ -1,20 +1,21 @@
 // ==UserScript==
 // @name         百度贴吧公开性别标记
 // @namespace    local.tieba-public-gender
-// @version      1.0.0
+// @version      1.0.1
 // @description  在帖子昵称旁显示用户公开资料中的性别；未公开或无法获取时显示未知。
 // @homepageURL  https://github.com/shiluodeqiou/tieba-public-gender
 // @supportURL   https://github.com/shiluodeqiou/tieba-public-gender/issues
 // @updateURL    https://raw.githubusercontent.com/shiluodeqiou/tieba-public-gender/main/tieba-public-gender.user.js
 // @downloadURL  https://raw.githubusercontent.com/shiluodeqiou/tieba-public-gender/main/tieba-public-gender.user.js
-// @match        https://tieba.baidu.com/p/*
-// @match        http://tieba.baidu.com/p/*
+// @match        https://tieba.baidu.com/*
+// @match        http://tieba.baidu.com/*
 // @run-at       document-idle
 // @noframes
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
 // @connect      tieba.baidu.com
 // @license      MIT
 // ==/UserScript==
@@ -24,7 +25,8 @@
 
     const CONFIG = Object.freeze({
         endpoint: 'https://tieba.baidu.com/home/get/panel',
-        cacheKey: 'tieba-public-gender:cache:v1',
+        cacheKey: 'tieba-public-gender:cache:v2',
+        enabledKey: 'tieba-public-gender:enabled',
         showUnknownKey: 'tieba-public-gender:show-unknown',
         knownTtlMs: 24 * 60 * 60 * 1000,
         unknownTtlMs: 60 * 60 * 1000,
@@ -34,18 +36,20 @@
         concurrency: 2,
         cooldownMs: 60 * 1000,
         maxCacheEntries: 500,
-        scanDelayMs: 120
+        scanDelayMs: 120,
+        routeCheckMs: 1000
     });
     const BADGE_CLASS = 'tb-public-gender-badge';
     // 楼中楼只选正文的第一个用户链接，排除头像、被回复者和正文中的 @ 提及。
     const NAME_SELECTOR = [
         'a.p_author_name',
         '.lzl_cnt > a.j_user_card:first-child',
-        '.lzl_cnt > a.at:first-child'
+        '.lzl_cnt > a.at:first-child',
+        '.user-info .name-info > a.head-name'
     ].join(',');
     const REASONS = Object.freeze({
         'not-public': '用户未公开可识别的性别资料',
-        'missing-identity': '页面未提供可靠的账号名，未使用显示昵称猜测',
+        'missing-identity': '页面未提供可靠的账号标识，未使用显示昵称猜测',
         'identity-mismatch': '资料返回的账号与请求账号不一致，已忽略',
         'unexpected-value': '接口返回了未支持的性别值，已忽略',
         'api-error': '贴吧资料接口未返回成功结果',
@@ -54,9 +58,11 @@
         'access-denied': '公开资料接口拒绝访问，未尝试使用登录凭据',
         'http-error': '公开资料接口暂时不可用',
         'network-error': '网络请求失败或油猴未允许请求',
+        'api-unavailable': '油猴请求接口不可用，请重新安装脚本或检查扩展权限',
         timeout: '公开资料请求超时',
         cooldown: '接口暂时不可用，正在等待恢复',
-        redirected: '资料请求被重定向到其他地址，已忽略'
+        redirected: '资料请求被重定向到其他地址，已忽略',
+        disabled: '标记功能已关闭，未发送新请求'
     });
 
     function unknown(reason) {
@@ -104,22 +110,74 @@
         return null;
     }
 
-    function buildProfileUrl(username) {
-        if (!validUsername(username)) throw new TypeError('无效账号名');
+    function normalizePortrait(value) {
+        // 公开接口的 portrait 会附带 ?t=时间戳；时间戳不是账号标识的一部分。
+        if (typeof value !== 'string' || value.length > 280) return null;
+        const match = /^(tb\.\d{1,3}\.[A-Za-z0-9._-]{1,240})(?:\?t=\d{1,20})?$/.exec(value);
+        return match ? match[1] : null;
+    }
+
+    function normalizeIdentity(identity) {
+        if (validUsername(identity)) return { kind: 'username', value: identity };
+        if (identity?.kind === 'username' && validUsername(identity.value)) return identity;
+        if (identity?.kind === 'portrait') {
+            const value = normalizePortrait(identity.value);
+            if (value) return { kind: 'portrait', value };
+        }
+        return null;
+    }
+
+    function extractIdentity(anchor) {
+        const username = extractUsername(anchor);
+        if (username) return { kind: 'username', value: username };
+        try {
+            const url = new URL(anchor.getAttribute('href') || '', 'https://tieba.baidu.com');
+            if (['https:', 'http:'].includes(url.protocol) && url.hostname === 'tieba.baidu.com' &&
+                url.pathname === '/home/main') {
+                const portrait = normalizePortrait(url.searchParams.get('id'));
+                if (portrait) return { kind: 'portrait', value: portrait };
+            }
+        } catch { /* 无效链接按未知处理。 */ }
+        return null;
+    }
+
+    function identityKey(identity) {
+        const normalized = normalizeIdentity(identity);
+        if (!normalized) return null;
+        // 保留旧接口传入的账号字符串；页面使用带类型的键，防止两类标识碰撞。
+        return typeof identity === 'string' ? identity : JSON.stringify([normalized.kind, normalized.value]);
+    }
+
+    function validCacheKey(key) {
+        if (validUsername(key)) return true;
+        try {
+            const value = JSON.parse(key);
+            return Array.isArray(value) && value.length === 2 &&
+                !!normalizeIdentity({ kind: value[0], value: value[1] });
+        } catch { return false; }
+    }
+
+    function buildProfileUrl(identity) {
+        const normalized = normalizeIdentity(identity);
+        if (!normalized) throw new TypeError('无效账号标识');
         const url = new URL(CONFIG.endpoint);
         url.searchParams.set('ie', 'utf-8');
-        url.searchParams.set('un', username);
+        url.searchParams.set(normalized.kind === 'portrait' ? 'id' : 'un', normalized.value);
         return url.href;
     }
 
-    function parsePanelResponse(payload, username) {
+    function parsePanelResponse(payload, identity) {
         if (!payload || typeof payload !== 'object' ||
             (payload.no !== 0 && payload.no !== '0')) return unknown('api-error');
         const data = payload.data;
         if (!data || typeof data !== 'object' || Array.isArray(data)) return unknown('api-error');
         // 当前接口的 data.name 是账号名，data.name_show/show_nickname 是显示昵称。
         // 必须有账号名且完全匹配；不把第三方或错误账号的资料展示给当前作者。
-        if (!validUsername(data.name) || data.name !== username) return unknown('identity-mismatch');
+        const requested = normalizeIdentity(identity);
+        if (!requested || !validUsername(data.name) || (requested.kind === 'username' ?
+            data.name !== requested.value : normalizePortrait(data.portrait) !== requested.value)) {
+            return unknown('identity-mismatch');
+        }
         if ([1, '1', true].includes(data.is_private)) return unknown('not-public');
         if (data.sex === 'male' || data.sex === 'female') {
             return { gender: data.sex, reason: 'public' };
@@ -141,7 +199,7 @@
                     ((value.gender === 'male' || value.gender === 'female') && value.reason === 'public') ||
                     (value.gender === 'unknown' && Object.hasOwn(REASONS, value.reason))
                 );
-                if (validUsername(name) && validResult && Number.isFinite(value.expiresAt) &&
+                if (validCacheKey(name) && validResult && Number.isFinite(value.expiresAt) &&
                     value.expiresAt > now() && value.expiresAt <= now() + CONFIG.knownTtlMs) {
                     entries.set(name, value);
                 }
@@ -257,37 +315,49 @@
     }
 
     function createLookup({ cache, request, enqueue, onCacheChange = () => {},
-        now = Date.now } = {}) {
+        shouldRequest = () => true, now = Date.now } = {}) {
         const pending = new Map();
         let blockedUntil = 0;
         return (name) => {
-            const saved = cache.get(name);
+            const key = identityKey(name);
+            if (!key) return Promise.resolve(unknown('missing-identity'));
+            const saved = cache.get(key);
             if (saved) return Promise.resolve(saved);
-            if (pending.has(name)) return pending.get(name);
+            if (pending.has(key)) return pending.get(key);
             const promise = enqueue(async () => {
+                if (!shouldRequest()) return unknown('disabled');
                 const result = now() < blockedUntil ? unknown('cooldown') : await request(name);
                 if (['rate-limited', 'access-denied', 'invalid-response', 'redirected'].includes(result.reason)) {
                     blockedUntil = now() + CONFIG.cooldownMs;
                 }
-                cache.set(name, result);
+                cache.set(key, result);
                 onCacheChange();
                 return result;
-            }).catch(() => unknown('network-error')).finally(() => pending.delete(name));
-            pending.set(name, promise);
+            }).catch(() => unknown('network-error')).finally(() => pending.delete(key));
+            pending.set(key, promise);
             return promise;
         };
     }
 
     function bootstrap(env = globalThis, options = {}) {
         const doc = env.document;
-        if (!doc?.body || env.location.hostname !== 'tieba.baidu.com' ||
-            !/^\/p\/\d+\/?$/.test(env.location.pathname)) return null;
+        if (!doc?.body || env.location.hostname !== 'tieba.baidu.com') return null;
+        const isPostPage = () => /^\/p\/\d+\/?$/.test(env.location.pathname);
+        // 油猴可能把 GM 接口注入词法作用域，而不挂在 globalThis/window 上。
+        const api = options.gm || {
+            getValue: typeof GM_getValue === 'function' ? GM_getValue : env.GM_getValue,
+            setValue: typeof GM_setValue === 'function' ? GM_setValue : env.GM_setValue,
+            request: typeof GM_xmlhttpRequest === 'function' ? GM_xmlhttpRequest : env.GM_xmlhttpRequest,
+            registerMenu: typeof GM_registerMenuCommand === 'function' ? GM_registerMenuCommand : env.GM_registerMenuCommand,
+            unregisterMenu: typeof GM_unregisterMenuCommand === 'function' ? GM_unregisterMenuCommand : env.GM_unregisterMenuCommand
+        };
         const getValue = (key, fallback) => {
-            try { return env.GM_getValue(key, fallback); } catch { return fallback; }
+            try { return api.getValue(key, fallback); } catch { return fallback; }
         };
         const setValue = (key, value) => {
-            try { env.GM_setValue(key, value); } catch { /* 禁用存储时仍可临时工作。 */ }
+            try { api.setValue(key, value); } catch { /* 禁用存储时仍可临时工作。 */ }
         };
+        let enabled = getValue(CONFIG.enabledKey, true) !== false;
         let showUnknown = getValue(CONFIG.showUnknownKey, true) !== false;
         const cache = createCache({ initial: getValue(CONFIG.cacheKey, null) });
         const enqueue = createQueue({ ...options.queue,
@@ -301,7 +371,9 @@
             }, 250);
         };
         const lookup = createLookup({ cache, enqueue, onCacheChange: save,
-            request: (name) => requestGender(name, env.GM_xmlhttpRequest, {
+            shouldRequest: () => enabled && isPostPage(),
+            request: (name) => typeof api.request !== 'function' ? Promise.resolve(unknown('api-unavailable')) :
+                requestGender(name, api.request, {
                 setTimer: env.setTimeout.bind(env), clearTimer: env.clearTimeout.bind(env)
             }) });
         const style = doc.createElement('style');
@@ -319,10 +391,76 @@
             .${BADGE_CLASS}[data-gender="unknown"],
             .${BADGE_CLASS}[data-gender="loading"] { color: #666 !important; }
             .${BADGE_CLASS}[hidden] { display: none !important; }
+            #tb-public-gender-status {
+                position: fixed !important; right: 16px !important; bottom: 18px !important;
+                width: 270px !important; max-width: calc(100vw - 32px) !important;
+                box-sizing: border-box !important; z-index: 2147483000 !important;
+                background: #fff !important; color: #253247 !important;
+                border: 1px solid #c5d3e4 !important; border-radius: 10px !important;
+                box-shadow: 0 3px 16px #16325225 !important; padding: 12px !important;
+                font: 13px/1.6 system-ui, sans-serif !important; text-align: left !important;
+            }
+            #tb-public-gender-status .tbpg-header { display: flex; align-items: center; justify-content: space-between; }
+            #tb-public-gender-status .tbpg-title { font-weight: 700; }
+            #tb-public-gender-status .tbpg-summary { margin-top: 7px; }
+            #tb-public-gender-status .tbpg-detail { color: #526478; margin: 6px 0 9px; overflow-wrap: anywhere; }
+            #tb-public-gender-status .tbpg-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+            #tb-public-gender-status button {
+                appearance: none !important; box-sizing: border-box !important;
+                cursor: pointer !important; border: 1px solid #c5d3e4 !important;
+                background: #f2f6fb !important; color: #243d5c !important;
+                border-radius: 5px !important; padding: 3px 7px !important;
+                font: inherit !important; line-height: 1.5 !important;
+            }
+            #tb-public-gender-status [hidden] { display: none !important; }
         `;
         (doc.head || doc.body).append(style);
-        const states = new WeakMap();
+        let states = new WeakMap();
         const badgeResults = new WeakMap();
+        const panel = doc.createElement('aside');
+        panel.id = 'tb-public-gender-status';
+        panel.setAttribute('aria-label', '贴吧公开性别标记状态与设置');
+        panel.innerHTML = `<div class="tbpg-header"><span class="tbpg-title"></span>
+            <button type="button" class="tbpg-collapse" aria-label="收起状态面板" aria-expanded="true">−</button></div>
+            <div class="tbpg-content"><div class="tbpg-summary" aria-live="polite"></div>
+            <div class="tbpg-detail"></div><div class="tbpg-actions">
+            <button type="button" class="tbpg-toggle"></button>
+            <button type="button" class="tbpg-unknown"></button>
+            <button type="button" class="tbpg-retry">重新查询</button></div></div>`;
+        const title = panel.querySelector('.tbpg-title');
+        const summary = panel.querySelector('.tbpg-summary');
+        const detail = panel.querySelector('.tbpg-detail');
+        const enabledButton = panel.querySelector('.tbpg-toggle');
+        const unknownButton = panel.querySelector('.tbpg-unknown');
+        const setText = (element, value) => { if (element.textContent !== value) element.textContent = value; };
+        function updatePanel() {
+            if (!isPostPage()) return;
+            if (!panel.isConnected) doc.body.append(panel);
+            const authors = doc.querySelectorAll(NAME_SELECTOR).length;
+            const counts = { male: 0, female: 0, unknown: 0, loading: 0 };
+            const reasons = new Map();
+            for (const badge of doc.querySelectorAll(`.${BADGE_CLASS}`)) {
+                const result = badgeResults.get(badge);
+                if (!result) continue;
+                counts[result.gender] += 1;
+                if (result.gender === 'unknown') reasons.set(result.reason, (reasons.get(result.reason) || 0) + 1);
+            }
+            panel.dataset.enabled = String(enabled);
+            panel.dataset.authors = String(authors);
+            setText(title, `公开性别：${enabled ? '已开启' : '已关闭'} · 1.0.1`);
+            setText(summary, `识别 ${authors} 个作者 · 男 ${counts.male} · 女 ${counts.female} · 未知 ${counts.unknown}${showUnknown ? '' : '（隐藏）'}${counts.loading ? ` · 查询中 ${counts.loading}` : ''}`);
+            let message = '标记来自公开自填资料，不代表真实身份。';
+            if (!enabled) message = '标记已隐藏，并停止后续新查询。点击“开启标记”可恢复。';
+            else if (!authors) message = '尚未识别到作者，正在等待帖子内容。若持续为 0，可能是页面结构变化。';
+            else if (typeof api.request !== 'function') message = REASONS['api-unavailable'];
+            else if (reasons.size) message = [...reasons].slice(0, 3).map(([reason, count]) => `${count} 个：${REASONS[reason]}`).join('；');
+            else if (counts.loading) message = '正在排队查询公开资料，请稍候。';
+            setText(detail, message);
+            setText(enabledButton, enabled ? '关闭标记' : '开启标记');
+            enabledButton.setAttribute('aria-pressed', String(enabled));
+            setText(unknownButton, showUnknown ? '隐藏未知' : '显示未知');
+            unknownButton.setAttribute('aria-pressed', String(showUnknown));
+        }
         function paint(badge, result) {
             badge.dataset.gender = result.gender;
             badgeResults.set(badge, result);
@@ -333,16 +471,32 @@
                 result.gender === 'loading' ? '正在查询公开资料' : `未知：${REASONS[result.reason]}`;
             badge.title = explanation;
             badge.setAttribute('aria-label', explanation);
-            badge.hidden = !showUnknown && ['unknown', 'loading'].includes(result.gender);
+            badge.hidden = !enabled || (!showUnknown && ['unknown', 'loading'].includes(result.gender));
+            updatePanel();
+        }
+        function clearBadges() {
+            for (const badge of doc.querySelectorAll(`.${BADGE_CLASS}`)) badge.remove();
+            states = new WeakMap();
         }
         function scan() {
+            if (!isPostPage()) {
+                clearBadges();
+                panel.remove();
+                return;
+            }
+            if (!enabled) {
+                clearBadges();
+                updatePanel();
+                return;
+            }
             // 页面可能单独移除昵称，或复制已经带标记的节点；清除失去对应关系的标记。
             for (const badge of doc.querySelectorAll(`.${BADGE_CLASS}`)) {
                 const anchor = badge.previousElementSibling;
                 if (!anchor?.matches(NAME_SELECTOR) || states.get(anchor)?.badge !== badge) badge.remove();
             }
             for (const anchor of doc.querySelectorAll(NAME_SELECTOR)) {
-                const name = extractUsername(anchor);
+                const identity = extractIdentity(anchor);
+                const name = identityKey(identity);
                 const old = states.get(anchor);
                 if (old && old.name === name && old.badge.isConnected) {
                     // 某些页面会整体移动昵称节点，保持标记紧邻对应昵称。
@@ -360,11 +514,18 @@
                     continue;
                 }
                 paint(badge, { gender: 'loading' });
-                lookup(name).then((result) => {
+                lookup(identity).then((result) => {
                     if (states.get(anchor) === state && badge.isConnected &&
-                        extractUsername(anchor) === name) paint(badge, result);
+                        identityKey(extractIdentity(anchor)) === name && enabled && isPostPage()) {
+                        if (result.reason === 'disabled') {
+                            states.delete(anchor);
+                            badge.remove();
+                            scheduleScan();
+                        } else paint(badge, result);
+                    }
                 });
             }
+            updatePanel();
         }
         let scanTimer = null;
         const scheduleScan = () => {
@@ -372,36 +533,81 @@
             scanTimer = env.setTimeout(() => { scanTimer = null; scan(); }, CONFIG.scanDelayMs);
         };
         // 忽略脚本自身的标记变化，避免观察器反复触发自身扫描。
-        const isBadge = (node) => node?.nodeType === 1 && node.classList.contains(BADGE_CLASS);
+        const isOwn = (node) => node?.nodeType === 1 && (node.classList.contains(BADGE_CLASS) || node === panel);
         const observer = new env.MutationObserver((records) => {
+            if (!isPostPage()) return;
             if (records.some((record) => {
-                if (record.target.closest?.(`.${BADGE_CLASS}`)) return false;
+                if (record.target.closest?.(`.${BADGE_CLASS}, #tb-public-gender-status`)) return false;
                 if (record.type === 'attributes') return true;
                 return [...record.addedNodes, ...record.removedNodes].some((node) =>
-                    node.nodeType === 1 && !isBadge(node));
+                    node.nodeType === 1 && !isOwn(node));
             })) scheduleScan();
         });
-        observer.observe(doc.body, { childList: true, subtree: true, attributes: true,
+        observer.observe(doc.documentElement, { childList: true, subtree: true, attributes: true,
             attributeFilter: ['data-field', 'username', 'href', 'class'] });
-        scan();
-        if (typeof env.GM_registerMenuCommand === 'function') {
-            env.GM_registerMenuCommand('显示/隐藏“未知”标记', () => {
-                showUnknown = !showUnknown;
-                setValue(CONFIG.showUnknownKey, showUnknown);
-                for (const badge of doc.querySelectorAll(`.${BADGE_CLASS}`)) {
-                    const result = badgeResults.get(badge);
-                    if (result) paint(badge, result);
-                }
-            });
-            env.GM_registerMenuCommand('清空性别资料缓存并刷新', () => {
-                cache.clear();
-                setValue(CONFIG.cacheKey, cache.snapshot());
-                env.location.reload();
-            });
+        let menuIds = [];
+        function updateMenus() {
+            if (typeof api.registerMenu !== 'function') return;
+            if (menuIds.length && typeof api.unregisterMenu !== 'function') return;
+            for (const id of menuIds) {
+                try { api.unregisterMenu(id); } catch { /* 旧管理器仍可使用页面按钮。 */ }
+            }
+            menuIds = [
+                api.registerMenu(`标记功能：${enabled ? '已开启（点击关闭）' : '已关闭（点击开启）'}`, toggleEnabled),
+                api.registerMenu(`未知标记：${showUnknown ? '显示（点击隐藏）' : '隐藏（点击显示）'}`, toggleUnknown),
+                api.registerMenu('清空性别资料缓存并重新查询', retry)
+            ];
         }
+        function toggleEnabled() {
+            enabled = !enabled;
+            setValue(CONFIG.enabledKey, enabled);
+            scan();
+            updateMenus();
+        }
+        function toggleUnknown() {
+            showUnknown = !showUnknown;
+            setValue(CONFIG.showUnknownKey, showUnknown);
+            for (const badge of doc.querySelectorAll(`.${BADGE_CLASS}`)) {
+                const result = badgeResults.get(badge);
+                if (result) paint(badge, result);
+            }
+            updatePanel();
+            updateMenus();
+        }
+        function retry() {
+            cache.clear();
+            setValue(CONFIG.cacheKey, cache.snapshot());
+            clearBadges();
+            scan();
+        }
+        enabledButton.addEventListener('click', toggleEnabled);
+        unknownButton.addEventListener('click', toggleUnknown);
+        panel.querySelector('.tbpg-retry').addEventListener('click', retry);
+        panel.querySelector('.tbpg-collapse').addEventListener('click', (event) => {
+            const content = panel.querySelector('.tbpg-content');
+            content.hidden = !content.hidden;
+            event.currentTarget.textContent = content.hidden ? '+' : '−';
+            event.currentTarget.setAttribute('aria-expanded', String(!content.hidden));
+            event.currentTarget.setAttribute('aria-label', content.hidden ? '展开状态面板' : '收起状态面板');
+        });
+        let previousRoute = env.location.pathname + env.location.search;
+        const checkRoute = () => {
+            const route = env.location.pathname + env.location.search;
+            if (route !== previousRoute) {
+                previousRoute = route;
+                clearBadges();
+                scan();
+            }
+        };
+        const routeTimer = env.setInterval(checkRoute, CONFIG.routeCheckMs);
+        env.addEventListener('popstate', checkRoute);
+        scan();
+        updateMenus();
         env.addEventListener('pagehide', () => setValue(CONFIG.cacheKey, cache.snapshot()));
-        return { scan, disconnect() {
+        return { scan, toggleEnabled, toggleUnknown, retry, disconnect() {
             observer.disconnect();
+            env.clearInterval(routeTimer);
+            env.removeEventListener('popstate', checkRoute);
             if (scanTimer !== null) env.clearTimeout(scanTimer);
             if (saveTimer !== null) env.clearTimeout(saveTimer);
         } };
@@ -409,9 +615,10 @@
 
     // 开发测试直接加载同一份可安装脚本，无须生成另一份构建产物。
     if (typeof module === 'object' && module.exports && typeof process === 'object' && process.versions?.node) {
-        module.exports = { CONFIG, NAME_SELECTOR, extractUsername, buildProfileUrl,
+        module.exports = { CONFIG, NAME_SELECTOR, extractUsername, extractIdentity, normalizePortrait, identityKey, buildProfileUrl,
             parsePanelResponse, createCache, createQueue, requestGender, createLookup, bootstrap };
     } else {
-        bootstrap();
+        if (globalThis.document?.body) bootstrap();
+        else globalThis.addEventListener('DOMContentLoaded', () => bootstrap(), { once: true });
     }
 })();

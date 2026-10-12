@@ -1,6 +1,6 @@
 {
   "name": "tieba-public-gender",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "description": "在百度贴吧帖子昵称旁显示用户公开填写的性别资料。",
   "license": "MIT",

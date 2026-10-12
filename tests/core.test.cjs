@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
-    CONFIG, buildProfileUrl, parsePanelResponse, createCache,
+    CONFIG, normalizePortrait, identityKey, buildProfileUrl, parsePanelResponse, createCache,
     createQueue, requestGender, createLookup
 } = require('../tieba-public-gender.user.js');
 
@@ -41,6 +41,42 @@ test('采用已核实的公开枚举，但错误账号、私密资料及数值�
     assert.equal(parsePanelResponse({ no: 1, data: { name: '账号甲', sex: 'male' } }, '账号甲').reason, 'api-error');
     assert.equal(parsePanelResponse({ data: { name: '账号甲', sex: 'male' } }, '账号甲').reason, 'api-error');
     assert.equal(parsePanelResponse({ no: 0, data: [] }, '账号甲').reason, 'api-error');
+});
+
+test('新版 portrait 仅采用已核实格式；编码后使用 id，返回时间戳后缀可规范化', () => {
+    const id = 'tb.1.fixture.Abc_123-test';
+    const identity = { kind: 'portrait', value: id };
+    const url = new URL(buildProfileUrl(identity));
+    assert.equal(url.searchParams.get('id'), id);
+    assert.equal(url.searchParams.has('un'), false);
+    assert.equal(normalizePortrait(`${id}?t=1773053660`), id);
+    assert.equal(parsePanelResponse(panel('实际账号', 'male', { portrait: `${id}?t=1773053660` }), identity).gender, 'male');
+    assert.equal(parsePanelResponse(panel('实际账号', 'female', { portrait: 'tb.1.fixture.other' }), identity).reason, 'identity-mismatch');
+    assert.equal(parsePanelResponse(panel('实际账号', 'male'), identity).reason, 'identity-mismatch');
+    assert.equal(parsePanelResponse(panel('实际账号', 'female', { portrait: id, is_private: 1 }), identity).reason, 'not-public');
+    for (const value of ['opaque', `${id}?t=abc`, `${id}&un=其他账号`, 'tb.1.', `tb.1234.test`, `${id}?t=1&x=2`]) {
+        assert.equal(normalizePortrait(value), null);
+        assert.throws(() => buildProfileUrl({ kind: 'portrait', value }), TypeError);
+    }
+});
+
+test('账号名和 portrait 同字面值也不会共用缓存；长 portrait 可持久化恢复', async () => {
+    const id = `tb.1.${'a'.repeat(160)}`;
+    const username = { kind: 'username', value: 'tb.1.same' };
+    const portrait = { kind: 'portrait', value: 'tb.1.same' };
+    assert.notEqual(identityKey(username), identityKey(portrait));
+    const cache = createCache();
+    cache.set(identityKey({ kind: 'portrait', value: id }), { gender: 'female', reason: 'public' });
+    const restored = createCache({ initial: cache.snapshot() });
+    assert.equal(restored.get(identityKey({ kind: 'portrait', value: id })).gender, 'female');
+    const calls = [];
+    const lookup = createLookup({ cache, enqueue: createQueue({ intervalMs: 0 }), request: async (identity) => {
+        calls.push(identity.kind);
+        return { gender: identity.kind === 'username' ? 'male' : 'female', reason: 'public' };
+    } });
+    assert.equal((await lookup(username)).gender, 'male');
+    assert.equal((await lookup(portrait)).gender, 'female');
+    assert.deepEqual(calls, ['username', 'portrait']);
 });
 
 test('缓存按结果类别到期，错误不会长期保留，且总量受限', () => {
@@ -153,6 +189,33 @@ test('重复账号合并正在进行的请求，并在成功后复用缓存', as
     assert.deepEqual(results[0], results[1]);
     assert.equal((await lookup('重复账号')).gender, 'female');
     assert.equal(requests, 1);
+});
+
+test('关闭后跳过未发出的排队请求且不缓存关闭状态；恢复后可查询', async () => {
+    const cache = createCache();
+    let enabled = true;
+    let release;
+    const calls = [];
+    const lookup = createLookup({ cache, shouldRequest: () => enabled,
+        enqueue: createQueue({ concurrency: 1, intervalMs: 0 }), request: (name) => {
+            calls.push(name);
+            return new Promise((resolve) => { release = resolve; });
+        } });
+    const first = lookup('首个账号');
+    const waiting = lookup('排队账号');
+    await turn();
+    enabled = false;
+    release({ gender: 'male', reason: 'public' });
+    await first;
+    assert.equal((await waiting).reason, 'disabled');
+    assert.deepEqual(calls, ['首个账号']);
+    assert.equal(cache.get('排队账号'), null);
+    enabled = true;
+    const resumed = lookup('排队账号');
+    await turn();
+    release({ gender: 'female', reason: 'public' });
+    assert.equal((await resumed).gender, 'female');
+    assert.deepEqual(calls, ['首个账号', '排队账号']);
 });
 
 test('遭遇限流时，已排队账号不再继续联网；暂停结束后新账号可以查询', async () => {
