@@ -251,36 +251,31 @@ test('新版主楼、回复和楼中楼使用 portrait 查询；不标记外层�
         for (const anchor of doc.querySelectorAll('.head-avatar, .mention, .name-info-link')) {
             assert.equal(anchor.nextElementSibling?.matches(BADGE) || false, false);
         }
-        assert.match(doc.querySelector('.tbpg-summary').textContent, /识别 3 个作者.*男 2.*女 1/);
+        assert.equal(doc.querySelector('#tb-public-gender-status'), null);
         await new Promise((resolve) => setTimeout(resolve, 350));
         assert.equal(fixture.requests.length, 2, '脚本自身修改不能触发重复查询');
     } finally { fixture.close(); }
 });
 
-test('初始关闭不查询；页面按钮和菜单切换状态并保存设置', async () => {
+test('初始关闭不查询；菜单切换状态并保存设置，页面不显示浮窗', async () => {
     const fixture = setup(main('账号甲'), null, { values: [[CONFIG.enabledKey, false]] });
     try {
         fixture.start();
         const doc = fixture.window.document;
-        assert.match(doc.querySelector('.tbpg-title').textContent, /已关闭.*1\.0\.1/);
+        assert.equal(doc.querySelector('#tb-public-gender-status'), null);
         assert.equal(doc.querySelector(BADGE), null);
         assert.equal(fixture.requests.length, 0);
         assert.ok(fixture.menus.has('标记功能：已关闭（点击开启）'));
-        doc.querySelector('.tbpg-toggle').click();
+        fixture.menus.get('标记功能：已关闭（点击开启）')();
         await waitFor(() => doc.querySelector(`${BADGE}[data-gender="male"]`));
         assert.equal(fixture.values.get(CONFIG.enabledKey), true);
-        assert.equal(doc.querySelector('.tbpg-toggle').getAttribute('aria-pressed'), 'true');
         assert.ok(fixture.menus.has('标记功能：已开启（点击关闭）'));
         fixture.menus.get('标记功能：已开启（点击关闭）')();
         assert.equal(doc.querySelector(BADGE), null);
         assert.equal(fixture.values.get(CONFIG.enabledKey), false);
-        assert.equal(doc.querySelector('.tbpg-toggle').textContent, '开启标记');
+        assert.ok(fixture.menus.has('标记功能：已关闭（点击开启）'));
         assert.equal(fixture.menus.size, 3);
-        doc.querySelector('.tbpg-collapse').click();
-        assert.equal(doc.querySelector('.tbpg-content').hidden, true);
-        assert.equal(doc.querySelector('.tbpg-collapse').getAttribute('aria-expanded'), 'false');
-        doc.querySelector('.tbpg-collapse').click();
-        assert.equal(doc.querySelector('.tbpg-content').hidden, false);
+        assert.equal(doc.querySelector('#tb-public-gender-status'), null);
     } finally { fixture.close(); }
 });
 
@@ -311,7 +306,7 @@ test('关闭后不发送排队请求，迟到响应不恢复标记，重新开�
     } finally { fixture.close(); }
 });
 
-test('未识别作者、请求接口缺失和请求失败均在面板明确提示', async () => {
+test('无作者时不查询；请求接口缺失和请求失败可通过标记查看原因', async () => {
     const empty = setup('帖子内容尚未载入');
     const missing = setup(main('账号甲'));
     const denied = setup(main('账号甲'), (details) => {
@@ -320,22 +315,23 @@ test('未识别作者、请求接口缺失和请求失败均在面板明确提�
     });
     try {
         empty.start();
-        assert.match(empty.window.document.querySelector('.tbpg-detail').textContent, /尚未识别到作者/);
+        assert.equal(empty.requests.length, 0);
+        assert.equal(empty.window.document.querySelector(BADGE), null);
         delete missing.window.GM_xmlhttpRequest;
         missing.start();
         await waitFor(() => missing.window.document.querySelector(`${BADGE}[data-gender="unknown"]`));
-        assert.match(missing.window.document.querySelector('.tbpg-detail').textContent, /油猴请求接口不可用/);
+        assert.match(missing.window.document.querySelector(BADGE).title, /油猴请求接口不可用/);
         denied.start();
         const doc = denied.window.document;
         await waitFor(() => doc.querySelector(`${BADGE}[data-gender="unknown"]`));
-        assert.match(doc.querySelector('.tbpg-detail').textContent, /拒绝访问/);
-        doc.querySelector('.tbpg-unknown').click();
+        assert.match(doc.querySelector(BADGE).title, /拒绝访问/);
+        denied.menus.get('未知标记：显示（点击隐藏）')();
         assert.equal(doc.querySelector(BADGE).hidden, true);
-        assert.match(doc.querySelector('.tbpg-summary').textContent, /未知 1（隐藏）/);
+        assert.ok(denied.menus.has('未知标记：隐藏（点击显示）'));
     } finally { empty.close(); missing.close(); denied.close(); }
 });
 
-test('从列表通过 SPA 进入帖子会启动，离开帖子后清理面板与标记', async () => {
+test('从列表通过 SPA 进入帖子会启动，离开帖子后清理标记', async () => {
     const fixture = setup(main('账号甲'), null, { url: 'https://tieba.baidu.com/f?kw=测试' });
     try {
         fixture.start();
@@ -380,7 +376,7 @@ test('油猴接口只存在词法作用域而不在 window 上时也能正常标
         assert.equal(dom.window.GM_xmlhttpRequest, undefined);
         assert.equal(requests, 1);
         assert.equal(menus.size, 3);
-        doc.querySelector('.tbpg-toggle').click();
+        menus.get('标记功能：已开启（点击关闭）')();
         assert.equal(values.get(CONFIG.enabledKey), false);
         assert.ok(menus.has('标记功能：已关闭（点击开启）'));
     } finally { dom.window.close(); }

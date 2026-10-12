@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         百度贴吧公开性别标记
 // @namespace    local.tieba-public-gender
-// @version      1.0.1
+// @version      1.0.2
 // @description  在帖子昵称旁显示用户公开资料中的性别；未公开或无法获取时显示未知。
 // @homepageURL  https://github.com/shiluodeqiou/tieba-public-gender
 // @supportURL   https://github.com/shiluodeqiou/tieba-public-gender/issues
@@ -391,76 +391,10 @@
             .${BADGE_CLASS}[data-gender="unknown"],
             .${BADGE_CLASS}[data-gender="loading"] { color: #666 !important; }
             .${BADGE_CLASS}[hidden] { display: none !important; }
-            #tb-public-gender-status {
-                position: fixed !important; right: 16px !important; bottom: 18px !important;
-                width: 270px !important; max-width: calc(100vw - 32px) !important;
-                box-sizing: border-box !important; z-index: 2147483000 !important;
-                background: #fff !important; color: #253247 !important;
-                border: 1px solid #c5d3e4 !important; border-radius: 10px !important;
-                box-shadow: 0 3px 16px #16325225 !important; padding: 12px !important;
-                font: 13px/1.6 system-ui, sans-serif !important; text-align: left !important;
-            }
-            #tb-public-gender-status .tbpg-header { display: flex; align-items: center; justify-content: space-between; }
-            #tb-public-gender-status .tbpg-title { font-weight: 700; }
-            #tb-public-gender-status .tbpg-summary { margin-top: 7px; }
-            #tb-public-gender-status .tbpg-detail { color: #526478; margin: 6px 0 9px; overflow-wrap: anywhere; }
-            #tb-public-gender-status .tbpg-actions { display: flex; flex-wrap: wrap; gap: 5px; }
-            #tb-public-gender-status button {
-                appearance: none !important; box-sizing: border-box !important;
-                cursor: pointer !important; border: 1px solid #c5d3e4 !important;
-                background: #f2f6fb !important; color: #243d5c !important;
-                border-radius: 5px !important; padding: 3px 7px !important;
-                font: inherit !important; line-height: 1.5 !important;
-            }
-            #tb-public-gender-status [hidden] { display: none !important; }
         `;
         (doc.head || doc.body).append(style);
         let states = new WeakMap();
         const badgeResults = new WeakMap();
-        const panel = doc.createElement('aside');
-        panel.id = 'tb-public-gender-status';
-        panel.setAttribute('aria-label', '贴吧公开性别标记状态与设置');
-        panel.innerHTML = `<div class="tbpg-header"><span class="tbpg-title"></span>
-            <button type="button" class="tbpg-collapse" aria-label="收起状态面板" aria-expanded="true">−</button></div>
-            <div class="tbpg-content"><div class="tbpg-summary" aria-live="polite"></div>
-            <div class="tbpg-detail"></div><div class="tbpg-actions">
-            <button type="button" class="tbpg-toggle"></button>
-            <button type="button" class="tbpg-unknown"></button>
-            <button type="button" class="tbpg-retry">重新查询</button></div></div>`;
-        const title = panel.querySelector('.tbpg-title');
-        const summary = panel.querySelector('.tbpg-summary');
-        const detail = panel.querySelector('.tbpg-detail');
-        const enabledButton = panel.querySelector('.tbpg-toggle');
-        const unknownButton = panel.querySelector('.tbpg-unknown');
-        const setText = (element, value) => { if (element.textContent !== value) element.textContent = value; };
-        function updatePanel() {
-            if (!isPostPage()) return;
-            if (!panel.isConnected) doc.body.append(panel);
-            const authors = doc.querySelectorAll(NAME_SELECTOR).length;
-            const counts = { male: 0, female: 0, unknown: 0, loading: 0 };
-            const reasons = new Map();
-            for (const badge of doc.querySelectorAll(`.${BADGE_CLASS}`)) {
-                const result = badgeResults.get(badge);
-                if (!result) continue;
-                counts[result.gender] += 1;
-                if (result.gender === 'unknown') reasons.set(result.reason, (reasons.get(result.reason) || 0) + 1);
-            }
-            panel.dataset.enabled = String(enabled);
-            panel.dataset.authors = String(authors);
-            setText(title, `公开性别：${enabled ? '已开启' : '已关闭'} · 1.0.1`);
-            setText(summary, `识别 ${authors} 个作者 · 男 ${counts.male} · 女 ${counts.female} · 未知 ${counts.unknown}${showUnknown ? '' : '（隐藏）'}${counts.loading ? ` · 查询中 ${counts.loading}` : ''}`);
-            let message = '标记来自公开自填资料，不代表真实身份。';
-            if (!enabled) message = '标记已隐藏，并停止后续新查询。点击“开启标记”可恢复。';
-            else if (!authors) message = '尚未识别到作者，正在等待帖子内容。若持续为 0，可能是页面结构变化。';
-            else if (typeof api.request !== 'function') message = REASONS['api-unavailable'];
-            else if (reasons.size) message = [...reasons].slice(0, 3).map(([reason, count]) => `${count} 个：${REASONS[reason]}`).join('；');
-            else if (counts.loading) message = '正在排队查询公开资料，请稍候。';
-            setText(detail, message);
-            setText(enabledButton, enabled ? '关闭标记' : '开启标记');
-            enabledButton.setAttribute('aria-pressed', String(enabled));
-            setText(unknownButton, showUnknown ? '隐藏未知' : '显示未知');
-            unknownButton.setAttribute('aria-pressed', String(showUnknown));
-        }
         function paint(badge, result) {
             badge.dataset.gender = result.gender;
             badgeResults.set(badge, result);
@@ -472,7 +406,6 @@
             badge.title = explanation;
             badge.setAttribute('aria-label', explanation);
             badge.hidden = !enabled || (!showUnknown && ['unknown', 'loading'].includes(result.gender));
-            updatePanel();
         }
         function clearBadges() {
             for (const badge of doc.querySelectorAll(`.${BADGE_CLASS}`)) badge.remove();
@@ -481,12 +414,10 @@
         function scan() {
             if (!isPostPage()) {
                 clearBadges();
-                panel.remove();
                 return;
             }
             if (!enabled) {
                 clearBadges();
-                updatePanel();
                 return;
             }
             // 页面可能单独移除昵称，或复制已经带标记的节点；清除失去对应关系的标记。
@@ -525,7 +456,6 @@
                     }
                 });
             }
-            updatePanel();
         }
         let scanTimer = null;
         const scheduleScan = () => {
@@ -533,11 +463,11 @@
             scanTimer = env.setTimeout(() => { scanTimer = null; scan(); }, CONFIG.scanDelayMs);
         };
         // 忽略脚本自身的标记变化，避免观察器反复触发自身扫描。
-        const isOwn = (node) => node?.nodeType === 1 && (node.classList.contains(BADGE_CLASS) || node === panel);
+        const isOwn = (node) => node?.nodeType === 1 && node.classList.contains(BADGE_CLASS);
         const observer = new env.MutationObserver((records) => {
             if (!isPostPage()) return;
             if (records.some((record) => {
-                if (record.target.closest?.(`.${BADGE_CLASS}, #tb-public-gender-status`)) return false;
+                if (record.target.closest?.(`.${BADGE_CLASS}`)) return false;
                 if (record.type === 'attributes') return true;
                 return [...record.addedNodes, ...record.removedNodes].some((node) =>
                     node.nodeType === 1 && !isOwn(node));
@@ -550,7 +480,7 @@
             if (typeof api.registerMenu !== 'function') return;
             if (menuIds.length && typeof api.unregisterMenu !== 'function') return;
             for (const id of menuIds) {
-                try { api.unregisterMenu(id); } catch { /* 旧管理器仍可使用页面按钮。 */ }
+                try { api.unregisterMenu(id); } catch { /* 管理器不支持时，刷新后显示最新菜单状态。 */ }
             }
             menuIds = [
                 api.registerMenu(`标记功能：${enabled ? '已开启（点击关闭）' : '已关闭（点击开启）'}`, toggleEnabled),
@@ -571,7 +501,6 @@
                 const result = badgeResults.get(badge);
                 if (result) paint(badge, result);
             }
-            updatePanel();
             updateMenus();
         }
         function retry() {
@@ -580,16 +509,6 @@
             clearBadges();
             scan();
         }
-        enabledButton.addEventListener('click', toggleEnabled);
-        unknownButton.addEventListener('click', toggleUnknown);
-        panel.querySelector('.tbpg-retry').addEventListener('click', retry);
-        panel.querySelector('.tbpg-collapse').addEventListener('click', (event) => {
-            const content = panel.querySelector('.tbpg-content');
-            content.hidden = !content.hidden;
-            event.currentTarget.textContent = content.hidden ? '+' : '−';
-            event.currentTarget.setAttribute('aria-expanded', String(!content.hidden));
-            event.currentTarget.setAttribute('aria-label', content.hidden ? '展开状态面板' : '收起状态面板');
-        });
         let previousRoute = env.location.pathname + env.location.search;
         const checkRoute = () => {
             const route = env.location.pathname + env.location.search;
