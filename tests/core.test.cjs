@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const createClock = require('./clock.cjs');
 const {
     CONFIG, normalizePortrait, identityKey, buildProfileUrl, parsePanelResponse, createCache,
     createQueue, requestGender, createLookup
@@ -218,22 +219,104 @@ test('关闭后跳过未发出的排队请求且不缓存关闭状态；恢复�
     assert.deepEqual(calls, ['首个账号', '排队账号']);
 });
 
-test('遭遇限流时，已排队账号不再继续联网；暂停结束后新账号可以查询', async () => {
-    let time = 0;
+test('限流时整条队列暂停一分钟，到期后原排队账号自动查询且不缓存冷却状态', async () => {
+    const clock = createClock();
     const names = [];
-    const lookup = createLookup({ cache: createCache({ now: () => time }), now: () => time,
-        enqueue: createQueue({ concurrency: 1, intervalMs: 0 }),
+    const cache = createCache({ now: clock.now });
+    const lookup = createLookup({ cache, now: clock.now,
+        enqueue: createQueue({ concurrency: 1, intervalMs: 0, ...clock }),
         request: async (name) => {
             names.push(name);
-            return name === '限流账号' ? { gender: 'unknown', reason: 'rate-limited' } :
+            return names.length === 1 ? { gender: 'unknown', reason: 'rate-limited' } :
                 { gender: 'male', reason: 'public' };
         } });
-    const results = await Promise.all([lookup('限流账号'), lookup('排队账号'), lookup('第二个排队账号')]);
+    const first = lookup('限流账号');
+    const waiting = lookup('排队账号');
+    const another = lookup('第二个排队账号');
+    await clock.advance(0);
+    assert.equal((await first).retryAt, CONFIG.cooldownMs);
     assert.deepEqual(names, ['限流账号']);
-    assert.deepEqual(results.map((result) => result.reason), ['rate-limited', 'cooldown', 'cooldown']);
-    time = CONFIG.cooldownMs;
-    assert.equal((await lookup('新账号')).gender, 'male');
-    assert.deepEqual(names, ['限流账号', '新账号']);
+    assert.equal(cache.snapshot().entries.length, 0);
+    await clock.advance(CONFIG.cooldownMs - 1);
+    assert.deepEqual(names, ['限流账号']);
+    await clock.advance(1);
+    assert.equal((await waiting).gender, 'male');
+    assert.equal((await another).gender, 'male');
+    assert.equal((await lookup('限流账号')).gender, 'male');
+    assert.deepEqual(names, ['限流账号', '排队账号', '第二个排队账号', '限流账号']);
+});
+
+test('最近使用的吧友优先保留，顺序可持久化，但读取不延长资料到期时间', () => {
+    let time = 0;
+    const cache = createCache({ maxEntries: 2, now: () => time });
+    cache.set('常见吧友', { gender: 'male', reason: 'public' });
+    cache.set('偶遇吧友', { gender: 'female', reason: 'public' });
+    time = 1000;
+    assert.equal(cache.get('常见吧友').gender, 'male');
+    const restored = createCache({ maxEntries: 2, now: () => time, initial: cache.snapshot() });
+    restored.set('新吧友', { gender: 'unknown', reason: 'not-public' });
+    assert.equal(restored.get('偶遇吧友'), null);
+    assert.equal(restored.get('常见吧友').gender, 'male');
+    time = CONFIG.knownTtlMs;
+    assert.equal(restored.get('常见吧友'), null);
+});
+
+test('升级时保留有效资料，丢弃旧版缓存中的冷却和取消状态', () => {
+    const entries = ['public', 'cooldown', 'disabled', 'rate-limited', 'access-denied', 'invalid-response', 'redirected']
+        .map(reason => [reason, { gender: reason === 'public' ? 'female' : 'unknown', reason, expiresAt: 5000 }]);
+    const cache = createCache({ now: () => 0, initial: { version: 1, entries } });
+    assert.deepEqual(cache.snapshot().entries.map(([key]) => key), ['public']);
+    cache.set('cold', { gender: 'unknown', reason: 'cooldown' });
+    assert.equal(cache.get('cold'), null);
+});
+
+test('整批旧任务取消后不消耗启动间隔，新请求仍遵守原有速率限制', async () => {
+    const clock = createClock();
+    const enqueue = createQueue({ intervalMs: 900, concurrency: 1, ...clock });
+    const calls = [];
+    const first = enqueue(() => calls.push(['first', clock.now()]));
+    const controllers = Array.from({ length: 20 }, () => new AbortController());
+    const stale = controllers.map(controller => enqueue(() => calls.push(['stale', clock.now()]),
+        { signal: controller.signal }));
+    await clock.advance(0);
+    for (const controller of controllers) controller.abort();
+    const fresh = enqueue(() => calls.push(['fresh', clock.now()]));
+    await clock.advance(899);
+    assert.deepEqual(calls, [['first', 0]]);
+    await clock.advance(1);
+    await Promise.all([first, fresh, ...stale]);
+    assert.deepEqual(calls, [['first', 0], ['fresh', 900]]);
+});
+
+test('重试不会绕过冷却，旧请求迟到结果不会回写或删除新请求的去重记录', async () => {
+    const clock = createClock();
+    const cache = createCache({ now: clock.now });
+    const responses = [];
+    const lookup = createLookup({ cache, now: clock.now,
+        enqueue: createQueue({ concurrency: 2, intervalMs: 0, ...clock }),
+        request: () => new Promise(resolve => responses.push(resolve)) });
+    const old = lookup('同一账号');
+    await clock.advance(0);
+    lookup.invalidate();
+    const fresh = lookup('同一账号');
+    await clock.advance(0);
+    responses[0]({ gender: 'male', reason: 'public' });
+    await clock.advance(0);
+    assert.equal((await old).reason, 'disabled');
+    assert.equal(cache.get('同一账号'), null);
+    assert.equal(lookup('同一账号'), fresh);
+    responses[1]({ gender: 'unknown', reason: 'rate-limited' });
+    await clock.advance(0);
+    assert.equal((await fresh).retryAt, CONFIG.cooldownMs);
+    lookup.invalidate();
+    const retry = lookup('同一账号');
+    await clock.advance(CONFIG.cooldownMs - 1);
+    assert.equal(responses.length, 2);
+    await clock.advance(1);
+    assert.equal(responses.length, 3);
+    responses[2]({ gender: 'female', reason: 'public' });
+    await clock.advance(0);
+    assert.equal((await retry).gender, 'female');
 });
 
 test('匿名请求可解析资料，且没有添加 Cookie 或身份认证头', async () => {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         百度贴吧公开性别标记
 // @namespace    local.tieba-public-gender
-// @version      1.0.2
+// @version      1.0.3
 // @description  在帖子昵称旁显示用户公开资料中的性别；未公开或无法获取时显示未知。
 // @homepageURL  https://github.com/shiluodeqiou/tieba-public-gender
 // @supportURL   https://github.com/shiluodeqiou/tieba-public-gender/issues
@@ -40,6 +40,8 @@
         routeCheckMs: 1000
     });
     const BADGE_CLASS = 'tb-public-gender-badge';
+    const COOLDOWN_REASONS = new Set(['rate-limited', 'access-denied', 'invalid-response', 'redirected']);
+    const TRANSIENT_REASONS = new Set(['disabled', 'cooldown', ...COOLDOWN_REASONS]);
     // 楼中楼只选正文的第一个用户链接，排除头像、被回复者和正文中的 @ 提及。
     const NAME_SELECTOR = [
         'a.p_author_name',
@@ -197,7 +199,8 @@
                 const [name, value] = entry;
                 const validResult = value && (
                     ((value.gender === 'male' || value.gender === 'female') && value.reason === 'public') ||
-                    (value.gender === 'unknown' && Object.hasOwn(REASONS, value.reason))
+                    (value.gender === 'unknown' && Object.hasOwn(REASONS, value.reason) &&
+                        !TRANSIENT_REASONS.has(value.reason))
                 );
                 if (validCacheKey(name) && validResult && Number.isFinite(value.expiresAt) &&
                     value.expiresAt > now() && value.expiresAt <= now() + CONFIG.knownTtlMs) {
@@ -219,9 +222,13 @@
                     entries.delete(name);
                     return null;
                 }
+                // 优先保留最近遇到的吧友；读取不延长资料本身的有效期。
+                entries.delete(name);
+                entries.set(name, entry);
                 return { gender: entry.gender, reason: entry.reason };
             },
             set(name, result) {
+                if (TRANSIENT_REASONS.has(result.reason)) return;
                 const ttl = result.reason === 'public' ? CONFIG.knownTtlMs :
                     ['not-public', 'unexpected-value'].includes(result.reason) ?
                         CONFIG.unknownTtlMs : CONFIG.errorTtlMs;
@@ -238,35 +245,53 @@
     }
 
     function createQueue({ concurrency = CONFIG.concurrency, intervalMs = CONFIG.intervalMs,
-        now = Date.now, setTimer = setTimeout } = {}) {
+        now = Date.now, setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
         const tasks = [];
         let active = 0;
         let nextStart = 0;
+        let pausedUntil = 0;
         let timer = null;
         function pump() {
-            if (timer !== null || active >= concurrency || tasks.length === 0) return;
-            const wait = Math.max(0, nextStart - now());
+            if (timer !== null) { clearTimer(timer); timer = null; }
+            if (active >= concurrency || tasks.length === 0) return;
+            const wait = Math.max(0, nextStart - now(), pausedUntil - now());
             if (wait > 0) {
                 timer = setTimer(() => { timer = null; pump(); }, wait);
                 return;
             }
             const task = tasks.shift();
+            task.signal?.removeEventListener('abort', task.cancel);
             active += 1;
             nextStart = now() + intervalMs;
-            Promise.resolve().then(task.run).then(task.resolve, task.reject).finally(() => {
+            Promise.resolve().then(() => task.signal?.aborted ? unknown('disabled') : task.run())
+                .then(task.resolve, task.reject).finally(() => {
                 active -= 1;
                 pump();
             });
             pump();
         }
-        return (run) => new Promise((resolve, reject) => {
-            tasks.push({ run, resolve, reject });
+        const enqueue = (run, { signal } = {}) => new Promise((resolve, reject) => {
+            if (signal?.aborted) { resolve(unknown('disabled')); return; }
+            const task = { run, resolve, reject, signal };
+            task.cancel = () => {
+                const index = tasks.indexOf(task);
+                if (index < 0) return;
+                tasks.splice(index, 1);
+                signal.removeEventListener('abort', task.cancel);
+                resolve(unknown('disabled'));
+                // 一次失效操作可能取消整批任务，待这一批取消完成后再调度。
+                Promise.resolve().then(pump);
+            };
+            signal?.addEventListener('abort', task.cancel, { once: true });
+            tasks.push(task);
             pump();
         });
+        enqueue.pauseUntil = (time) => { pausedUntil = Math.max(pausedUntil, time); pump(); };
+        return enqueue;
     }
 
     function requestGender(username, gmRequest, { timeoutMs = CONFIG.timeoutMs,
-        setTimer = setTimeout, clearTimer = clearTimeout } = {}) {
+        setTimer = setTimeout, clearTimer = clearTimeout, signal } = {}) {
         return new Promise((resolve) => {
             let settled = false;
             let handle;
@@ -275,8 +300,15 @@
                 if (settled) return;
                 settled = true;
                 clearTimer(timer);
+                signal?.removeEventListener('abort', cancel);
                 resolve(result);
             }
+            function cancel() {
+                finish(unknown('disabled'));
+                try { handle?.abort(); } catch { /* 即使扩展取消失败，也忽略迟到响应。 */ }
+            }
+            if (signal?.aborted) { cancel(); return; }
+            signal?.addEventListener('abort', cancel, { once: true });
             // anonymous 会使用 fetch 模式；部分浏览器不执行 GM 的 timeout，故另设计时器。
             timer = setTimer(() => {
                 finish(unknown('timeout'));
@@ -315,34 +347,54 @@
     }
 
     function createLookup({ cache, request, enqueue, onCacheChange = () => {},
-        shouldRequest = () => true, now = Date.now } = {}) {
+        shouldRequest = () => true, onCooldown = () => {}, now = Date.now } = {}) {
         const pending = new Map();
-        let blockedUntil = 0;
-        return (name) => {
+        let generation = 0;
+        const lookup = (name) => {
             const key = identityKey(name);
             if (!key) return Promise.resolve(unknown('missing-identity'));
             const saved = cache.get(key);
-            if (saved) return Promise.resolve(saved);
-            if (pending.has(key)) return pending.get(key);
+            if (saved) { onCacheChange(); return Promise.resolve(saved); }
+            if (pending.has(key)) return pending.get(key).promise;
+            const controller = new AbortController();
+            const epoch = generation;
+            const current = () => epoch === generation && !controller.signal.aborted && shouldRequest(name);
             const promise = enqueue(async () => {
-                if (!shouldRequest()) return unknown('disabled');
-                const result = now() < blockedUntil ? unknown('cooldown') : await request(name);
-                if (['rate-limited', 'access-denied', 'invalid-response', 'redirected'].includes(result.reason)) {
-                    blockedUntil = now() + CONFIG.cooldownMs;
+                if (!current()) return unknown('disabled');
+                const result = await request(name, { signal: controller.signal });
+                if (!current()) return unknown('disabled');
+                if (COOLDOWN_REASONS.has(result.reason)) {
+                    const retryAt = now() + CONFIG.cooldownMs;
+                    enqueue.pauseUntil(retryAt);
+                    onCooldown(retryAt);
+                    return { ...result, retryAt };
                 }
                 cache.set(key, result);
                 onCacheChange();
                 return result;
-            }).catch(() => unknown('network-error')).finally(() => pending.delete(key));
-            pending.set(key, promise);
+            }, { signal: controller.signal }).catch(() => unknown('network-error')).finally(() => {
+                if (pending.get(key)?.promise === promise) pending.delete(key);
+            });
+            pending.set(key, { promise, controller });
             return promise;
         };
+        lookup.invalidate = () => {
+            generation += 1;
+            const obsolete = [...pending.values()];
+            pending.clear();
+            for (const { controller } of obsolete) controller.abort();
+        };
+        return lookup;
     }
 
     function bootstrap(env = globalThis, options = {}) {
         const doc = env.document;
         if (!doc?.body || env.location.hostname !== 'tieba.baidu.com') return null;
         const isPostPage = () => /^\/p\/\d+\/?$/.test(env.location.pathname);
+        const now = options.now || Date.now;
+        const route = () => env.location.pathname + env.location.search;
+        let previousRoute = route();
+        let stopped = false;
         // 油猴可能把 GM 接口注入词法作用域，而不挂在 globalThis/window 上。
         const api = options.gm || {
             getValue: typeof GM_getValue === 'function' ? GM_getValue : env.GM_getValue,
@@ -359,10 +411,11 @@
         };
         let enabled = getValue(CONFIG.enabledKey, true) !== false;
         let showUnknown = getValue(CONFIG.showUnknownKey, true) !== false;
-        const cache = createCache({ initial: getValue(CONFIG.cacheKey, null) });
-        const enqueue = createQueue({ ...options.queue,
-            setTimer: env.setTimeout.bind(env) });
+        const cache = createCache({ initial: getValue(CONFIG.cacheKey, null), now });
+        const enqueue = createQueue({ now, ...options.queue,
+            setTimer: env.setTimeout.bind(env), clearTimer: env.clearTimeout.bind(env) });
         let saveTimer = null;
+        let recoveryTimer = null;
         const save = () => {
             if (saveTimer !== null) env.clearTimeout(saveTimer);
             saveTimer = env.setTimeout(() => {
@@ -370,11 +423,28 @@
                 setValue(CONFIG.cacheKey, cache.snapshot());
             }, 250);
         };
-        const lookup = createLookup({ cache, enqueue, onCacheChange: save,
-            shouldRequest: () => enabled && isPostPage(),
-            request: (name) => typeof api.request !== 'function' ? Promise.resolve(unknown('api-unavailable')) :
+        const lookup = createLookup({ cache, enqueue, now, onCacheChange: save,
+            shouldRequest: (name) => !stopped && enabled && isPostPage() && route() === previousRoute &&
+                [...doc.querySelectorAll(NAME_SELECTOR)].some(anchor => identityKey(extractIdentity(anchor)) === identityKey(name)),
+            onCooldown: (retryAt) => {
+                if (recoveryTimer !== null) env.clearTimeout(recoveryTimer);
+                recoveryTimer = env.setTimeout(() => {
+                    recoveryTimer = null;
+                    if (stopped || !enabled || !isPostPage()) return;
+                    for (const anchor of doc.querySelectorAll(NAME_SELECTOR)) {
+                        const state = states.get(anchor);
+                        const result = state && badgeResults.get(state.badge);
+                        if (result?.retryAt <= now()) {
+                            state.badge.remove();
+                            states.delete(anchor);
+                        }
+                    }
+                    scan();
+                }, Math.max(0, retryAt - now()));
+            },
+            request: (name, { signal }) => typeof api.request !== 'function' ? Promise.resolve(unknown('api-unavailable')) :
                 requestGender(name, api.request, {
-                setTimer: env.setTimeout.bind(env), clearTimer: env.clearTimeout.bind(env)
+                signal, setTimer: env.setTimeout.bind(env), clearTimer: env.clearTimeout.bind(env)
             }) });
         const style = doc.createElement('style');
         style.textContent = `
@@ -412,6 +482,12 @@
             states = new WeakMap();
         }
         function scan() {
+            if (stopped) return;
+            if (route() !== previousRoute) {
+                previousRoute = route();
+                lookup.invalidate();
+                clearBadges();
+            }
             if (!isPostPage()) {
                 clearBadges();
                 return;
@@ -459,7 +535,7 @@
         }
         let scanTimer = null;
         const scheduleScan = () => {
-            if (scanTimer !== null) return;
+            if (stopped || scanTimer !== null) return;
             scanTimer = env.setTimeout(() => { scanTimer = null; scan(); }, CONFIG.scanDelayMs);
         };
         // 忽略脚本自身的标记变化，避免观察器反复触发自身扫描。
@@ -491,6 +567,7 @@
         function toggleEnabled() {
             enabled = !enabled;
             setValue(CONFIG.enabledKey, enabled);
+            if (!enabled) lookup.invalidate();
             scan();
             updateMenus();
         }
@@ -504,31 +581,31 @@
             updateMenus();
         }
         function retry() {
+            lookup.invalidate();
             cache.clear();
             setValue(CONFIG.cacheKey, cache.snapshot());
             clearBadges();
             scan();
         }
-        let previousRoute = env.location.pathname + env.location.search;
         const checkRoute = () => {
-            const route = env.location.pathname + env.location.search;
-            if (route !== previousRoute) {
-                previousRoute = route;
-                clearBadges();
-                scan();
-            }
+            if (route() !== previousRoute) scan();
         };
         const routeTimer = env.setInterval(checkRoute, CONFIG.routeCheckMs);
         env.addEventListener('popstate', checkRoute);
         scan();
         updateMenus();
-        env.addEventListener('pagehide', () => setValue(CONFIG.cacheKey, cache.snapshot()));
+        const saveOnHide = () => setValue(CONFIG.cacheKey, cache.snapshot());
+        env.addEventListener('pagehide', saveOnHide);
         return { scan, toggleEnabled, toggleUnknown, retry, disconnect() {
+            stopped = true;
+            lookup.invalidate();
             observer.disconnect();
             env.clearInterval(routeTimer);
             env.removeEventListener('popstate', checkRoute);
+            env.removeEventListener('pagehide', saveOnHide);
             if (scanTimer !== null) env.clearTimeout(scanTimer);
             if (saveTimer !== null) env.clearTimeout(saveTimer);
+            if (recoveryTimer !== null) env.clearTimeout(recoveryTimer);
         } };
     }
 

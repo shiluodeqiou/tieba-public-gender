@@ -3,6 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { JSDOM, VirtualConsole } = require('jsdom');
+const createClock = require('./clock.cjs');
 const { extractUsername, extractIdentity, bootstrap, CONFIG } = require('../tieba-public-gender.user.js');
 
 const BADGE = '.tb-public-gender-badge';
@@ -25,6 +26,10 @@ function setup(html, customRequest, options = {}) {
         url: options.url || 'https://tieba.baidu.com/p/123456789?pn=1', virtualConsole
     });
     const window = dom.window;
+    if (options.clock) {
+        window.setTimeout = options.clock.setTimer;
+        window.clearTimeout = options.clock.clearTimer;
+    }
     const requests = [];
     const menus = new Map();
     const values = new Map(options.values);
@@ -43,7 +48,8 @@ function setup(html, customRequest, options = {}) {
     };
     let runtime;
     return { window, requests, menus, values, virtualConsole,
-        start() { runtime = bootstrap(window, { queue: { intervalMs: 0, ...options.queue } }); return runtime; },
+        start() { runtime = bootstrap(window, { now: options.clock?.now,
+            queue: { intervalMs: 0, ...options.queue } }); return runtime; },
         close() { runtime?.disconnect(); window.close(); } };
 }
 
@@ -296,13 +302,16 @@ test('关闭后不发送排队请求，迟到响应不恢复标记，重新开�
         assert.deepEqual(fixture.requests, ['账号甲']);
         assert.equal(doc.querySelector(BADGE), null);
         runtime.toggleEnabled();
+        await waitFor(() => fixture.requests.length === 2);
+        responses.get('账号甲').onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '账号甲', sex: 'male' } }) });
         await waitFor(() => responses.has('账号乙'));
         responses.get('账号乙').onload({ status: 200, responseText:
             JSON.stringify({ no: 0, data: { name: '账号乙', sex: 'female' } }) });
         await waitFor(() => doc.querySelector(`${BADGE}[data-gender="female"]`));
         assert.ok(doc.querySelector(`${BADGE}[data-gender="male"]`));
         assert.equal(doc.querySelector(`${BADGE}[data-gender="unknown"]`), null);
-        assert.deepEqual(fixture.requests, ['账号甲', '账号乙']);
+        assert.deepEqual(fixture.requests, ['账号甲', '账号甲', '账号乙']);
     } finally { fixture.close(); }
 });
 
@@ -380,4 +389,121 @@ test('油猴接口只存在词法作用域而不在 window 上时也能正常标
         assert.equal(values.get(CONFIG.enabledKey), false);
         assert.ok(menus.has('标记功能：已关闭（点击开启）'));
     } finally { dom.window.close(); }
+});
+
+test('重新查询取消旧请求，旧回调不会覆盖新标记或回写缓存', async () => {
+    const responses = [];
+    let aborts = 0;
+    const fixture = setup(main('账号甲'), details => {
+        responses.push(details);
+        return { abort() { aborts += 1; } };
+    }, { queue: { concurrency: 1 } });
+    try {
+        const runtime = fixture.start();
+        await waitFor(() => responses.length === 1);
+        runtime.retry();
+        await waitFor(() => responses.length === 2);
+        assert.equal(aborts, 1);
+        responses[1].onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '账号甲', sex: 'female' } }) });
+        const doc = fixture.window.document;
+        await waitFor(() => doc.querySelector(`${BADGE}[data-gender="female"]`));
+        responses[0].onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '账号甲', sex: 'male' } }) });
+        responses[0].onerror();
+        fixture.window.dispatchEvent(new fixture.window.Event('pagehide'));
+        assert.equal(doc.querySelector(BADGE).dataset.gender, 'female');
+        assert.equal(fixture.values.get(CONFIG.cacheKey).entries[0][1].gender, 'female');
+    } finally { fixture.close(); }
+});
+
+test('站内切换帖子后清除旧排队任务，旧响应不写缓存，新帖作者优先查询', async () => {
+    const responses = [];
+    const fixture = setup(main('旧甲') + main('旧乙') + main('旧丙'), (details, name) => {
+        responses.push({ details, name });
+        return { abort() {} };
+    }, { queue: { concurrency: 1 } });
+    try {
+        fixture.start();
+        await waitFor(() => responses.length === 1);
+        const { window } = fixture;
+        window.document.body.innerHTML = main('新丁');
+        window.history.pushState({}, '', '/p/987');
+        window.dispatchEvent(new window.PopStateEvent('popstate'));
+        await waitFor(() => responses.length === 2);
+        assert.deepEqual(fixture.requests, ['旧甲', '新丁']);
+        responses[0].details.onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '旧甲', sex: 'male' } }) });
+        responses[1].details.onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '新丁', sex: 'female' } }) });
+        await waitFor(() => window.document.querySelector(`${BADGE}[data-gender="female"]`));
+        window.dispatchEvent(new window.Event('pagehide'));
+        const entries = fixture.values.get(CONFIG.cacheKey).entries;
+        assert.equal(entries.length, 1);
+        assert.match(entries[0][0], /新丁/);
+    } finally { fixture.close(); }
+});
+
+test('昵称已从页面移除时，其排队请求在发送前会被跳过', async () => {
+    const responses = [];
+    const fixture = setup(main('账号甲') + main('账号乙'), details => {
+        responses.push(details);
+        return { abort() {} };
+    }, { queue: { concurrency: 1 } });
+    try {
+        fixture.start();
+        await waitFor(() => responses.length === 1);
+        fixture.window.document.querySelectorAll('.l_post')[1].remove();
+        responses[0].onload({ status: 200, responseText:
+            JSON.stringify({ no: 0, data: { name: '账号甲', sex: 'male' } }) });
+        await waitFor(() => fixture.window.document.querySelector(`${BADGE}[data-gender="male"]`));
+        assert.deepEqual(fixture.requests, ['账号甲']);
+    } finally { fixture.close(); }
+});
+
+test('冷却结束后当前页自动恢复查询，无需刷新或点击菜单', async () => {
+    const clock = createClock();
+    let failed = false;
+    const fixture = setup(main('账号甲') + main('账号乙'), (details, name) => {
+        if (!failed) {
+            failed = true;
+            queueMicrotask(() => details.onload({ status: 429 }));
+        } else {
+            queueMicrotask(() => details.onload({ status: 200, responseText:
+                JSON.stringify({ no: 0, data: { name, sex: 'female' } }) }));
+        }
+        return { abort() {} };
+    }, { clock, queue: { concurrency: 1 } });
+    try {
+        fixture.start();
+        const doc = fixture.window.document;
+        await clock.advance(0);
+        assert.deepEqual(fixture.requests, ['账号甲']);
+        assert.match(doc.querySelector(BADGE).title, /一分钟/);
+        await clock.advance(CONFIG.cooldownMs - 1);
+        assert.deepEqual(fixture.requests, ['账号甲']);
+        assert.equal(fixture.values.has(CONFIG.cacheKey), false);
+        await clock.advance(1);
+        assert.equal(doc.querySelectorAll(`${BADGE}[data-gender="female"]`).length, 2);
+        assert.deepEqual(fixture.requests, ['账号甲', '账号乙', '账号甲']);
+        await clock.advance(250);
+        assert.ok(fixture.values.get(CONFIG.cacheKey).entries.every(([, value]) => value.reason === 'public'));
+    } finally { fixture.close(); }
+});
+
+test('已缓存吧友在新的帖子或刷新后直接显示，缺少网络权限也无需重新请求', async () => {
+    const first = setup(main('账号甲'));
+    let second;
+    try {
+        first.start();
+        await waitFor(() => first.window.document.querySelector(`${BADGE}[data-gender="male"]`));
+        first.window.dispatchEvent(new first.window.Event('pagehide'));
+        second = setup(main('账号甲', '同一账号的新显示昵称'), null,
+            { values: first.values, url: 'https://tieba.baidu.com/p/999' });
+        delete second.window.GM_xmlhttpRequest;
+        second.start();
+        await waitFor(() => second.window.document.querySelector(`${BADGE}[data-gender="male"]`));
+        assert.equal(second.requests.length, 0);
+        assert.equal(second.window.document.querySelector(BADGE).textContent, '♂ 男');
+    } finally { first.close(); second?.close(); }
 });
